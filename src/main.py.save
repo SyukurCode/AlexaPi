@@ -1,0 +1,326 @@
+#! /usr/bin/env python3
+import pyaudio
+import mic
+import wave
+import importlib
+import os
+import logging
+import tempfile
+import signal
+import shutil
+import time
+import sys
+import threading
+import json
+import optparse
+import email
+import subprocess
+import hashlib
+
+import yaml
+import requests
+import coloredlogs
+
+import alexapi.config
+import alexapi.tunein as tunein
+import alexapi.capture
+import alexapi.triggers as triggers
+from alexapi.exceptions import ConfigurationException
+from alexapi.constants import RequestType, PlayerActivity
+
+logging.basicConfig(filename='/opt/AlexaPi/alexa.log',filemode='a',
+datefmt='%d-%m-%Y %H:%M:%S',format='%(asctime)s %(module)s %(levelname)s: %(message)s')
+coloredlogs.DEFAULT_FIELD_STYLES = {
+	'hostname': {'color': 'magenta'},
+	'programname': {'color': 'cyan'},
+	'name': {'color': 'blue'},
+	'levelname': {'color': 'magenta', 'bold': True},
+	'asctime': {'color': 'green'}
+}
+coloredlogs.DEFAULT_LEVEL_STYLES = {
+	'info': {'color': 'blue'},
+	'critical': {'color': 'red', 'bold': True},
+	'error': {'color': 'red'},
+	'debug': {'color': 'green'},
+	'warning': {'color': 'yellow'}
+}
+
+# Get arguments
+parser = optparse.OptionParser()
+parser.add_option('-s', '--silent',
+		dest="silent",
+		action="store_true",
+		default=False,
+		help="start without saying hello")
+parser.add_option('-d', '--debug',
+		dest="debug",
+		action="store_true",
+		default=False,
+		help="display debug messages")
+parser.add_option('--daemon',
+		dest="daemon",
+		action="store_true",
+		default=False,
+		help="Used by initd/systemd start script to reconfigure logging")
+
+cmdopts, cmdargs = parser.parse_args()
+silent = cmdopts.silent
+debug = cmdopts.debug
+
+config_exists = alexapi.config.filename is not None
+
+if config_exists:
+	with open(alexapi.config.filename, 'r') as stream:
+		config = yaml.load(stream)
+
+if debug:
+	log_level = logging.DEBUG
+else:
+	if config_exists:
+		log_level = logging.getLevelName(config.get('logging', 'INFO').upper())
+	else:
+		log_level = logging.getLevelName('INFO')
+
+if cmdopts.daemon:
+	coloredlogs.DEFAULT_LOG_FORMAT = '%(levelname)s: %(message)s'
+else:
+	coloredlogs.DEFAULT_LOG_FORMAT = '%(asctime)s %(levelname)s: %(message)s'
+
+coloredlogs.install(level=log_level)
+alexa_logger = logging.getLogger('alexapi')
+alexa_logger.setLevel(log_level)
+
+
+
+if not config_exists:
+	alexa_logger.critical('Can not find configuration file. Exiting...')
+	sys.exit(1)
+
+# Setup event commands
+event_commands = {
+	'startup': "",
+	'pre_interaction': "",
+	'post_interaction': "",
+	'shutdown': "",
+}
+
+if 'event_commands' in config:
+	event_commands.update(config['event_commands'])
+
+im = importlib.import_module('alexapi.device_platforms.' + config['platform']['device'] + 'platform', package=None)
+cl = getattr(im, config['platform']['device'].capitalize() + 'Platform')
+platform = cl(config)
+
+
+class Player:
+
+	config = None
+	platform = None
+	pHandler = None
+	tunein_parser = None
+
+	navigation_token = None
+	playlist_last_item = None
+	progressReportRequired = []
+
+	def __init__(self, config, platform, pHandler): # pylint: disable=redefined-outer-name
+		self.config = config
+		self.platform = platform
+		self.pHandler = pHandler # pylint: disable=invalid-name
+		self.tunein_parser = tunein.TuneIn(5000)
+
+	def play_playlist(self, payload):
+		self.navigation_token = payload['navigationToken']
+		self.playlist_last_item = payload['audioItem']['streams'][-1]['streamId']
+
+		for stream in payload['audioItem']['streams']: # pylint: disable=redefined-outer-name
+
+			streamId = stream['streamId']
+			if stream['progressReportRequired']:
+				self.progressReportRequired.append(streamId)
+
+			url = stream['streamUrl']
+			if stream['streamUrl'].startswith("cid:"):
+				url = "file://" + tmp_path + hashlib.md5(stream['streamUrl'].replace("cid:", "", 1).encode()).hexdigest() + ".mp3"
+
+			if (url.find('radiotime.com') != -1):
+				url = self.tunein_playlist(url)
+
+			self.pHandler.queued_play(url, stream['offsetInMilliseconds'], audio_type='media', stream_id=streamId)
+
+	def play_speech(self, mrl):
+		self.stop()
+		self.pHandler.blocking_play(mrl)
+
+	def stop(self):
+		self.pHandler.stop()
+
+	def is_playing(self):
+		return self.pHandler.is_playing()
+
+	def get_volume(self):
+		return self.pHandler.volume
+
+	def set_volume(self, volume):
+		self.pHandler.set_volume(volume)
+
+	def playback_callback(self, requestType, playerActivity, streamId):
+		if (requestType == RequestType.STARTED) and (playerActivity == PlayerActivity.PLAYING):
+			self.platform.indicate_playback()
+		elif (requestType in [RequestType.INTERRUPTED, RequestType.FINISHED, RequestType.ERROR]) and (playerActivity == PlayerActivity.IDLE):
+			self.platform.indicate_playback(False)
+
+		if streamId:
+			if streamId in self.progressReportRequired:
+				self.progressReportRequired.remove(streamId)
+				gThread = threading.Thread(target=alexa_playback_progress_report_request, args=(requestType, playerActivity, streamId))
+				gThread.start()
+
+			if (requestType == RequestType.FINISHED) and (playerActivity == PlayerActivity.IDLE) and (self.playlist_last_item == streamId):
+				gThread = threading.Thread(target=alexa_getnextitem, args=(self.navigation_token,))
+				self.navigation_token = None
+				gThread.start()
+
+	def tunein_playlist(self, url):
+		alexa_logger.debug("TUNE IN URL = %s", url)
+
+		req = requests.get(url)
+		lines = req.content.decode().split('\n')
+
+		nurl = self.tunein_parser.parse_stream_url(lines[0])
+		if nurl:
+			return nurl[0]
+
+		return ""
+
+
+# Playback handler
+def playback_callback(requestType, playerActivity, streamId):
+
+	return player.playback_callback(requestType, playerActivity, streamId)
+
+im = importlib.import_module('alexapi.playback_handlers.' + config['sound']['playback_handler'] + "handler", package=None)
+cl = getattr(im, config['sound']['playback_handler'].capitalize() + 'Handler')
+pHandler = cl(config, playback_callback)
+player = Player(config, platform, pHandler)
+
+
+path = os.path.realpath(__file__).rstrip(os.path.basename(__file__))
+resources_path = os.path.join(path, 'resources', '')
+tmp_path = os.path.join(tempfile.mkdtemp(prefix='AlexaPi-runtime-'), '')
+
+MAX_VOLUME = 100
+MIN_VOLUME = 30
+
+
+def internet_on():
+	try:
+		requests.get('https://api.amazon.com/auth/o2/token')
+		alexa_logger.info("Connection OK")
+		return True
+	except requests.exceptions.RequestException:
+		alexa_logger.error("Connection Failed")
+		return False
+
+trigger_thread = None
+
+def trigger_callback(trigger):
+	global trigger_thread
+
+	alexa_logger.info("Triggered: %s", trigger.name)
+
+	triggers.disable()
+
+	trigger_thread = threading.Thread(target=trigger_process, args=(trigger,))
+	trigger_thread.setDaemon(True)
+	trigger_thread.start()
+
+
+def trigger_process(trigger):
+
+	if player.is_playing():
+		player.stop()
+
+	# clean up the temp directory
+	if not debug:
+		for some_file in os.listdir(tmp_path):
+			file_path = os.path.join(tmp_path, some_file)
+			try:
+				if os.path.isfile(file_path):
+					os.remove(file_path)
+			except Exception as exp: # pylint: disable=broad-except
+				alexa_logger.warning(exp)
+
+	if event_commands['pre_interaction']:
+		subprocess.Popen(event_commands['pre_interaction'], shell=True, stdout=subprocess.PIPE)
+
+	force_record = None
+	if trigger.event_type in triggers.types_continuous:
+		force_record = (trigger.continuous_callback, trigger.event_type in triggers.types_vad)
+
+	if trigger.voice_confirm:
+		player.play_speech(resources_path + 'ya.mp3')
+
+	if not internet_on():
+		player.play_speech(resources_path + 'no_internet_services.mp3')
+
+
+	listener = mic.record(tmp_path)
+	listener.listen()
+
+	triggers.enable()
+
+	if event_commands['post_interaction']:
+		subprocess.Popen(event_commands['post_interaction'], shell=True, stdout=subprocess.PIPE)
+
+
+def cleanup(signal, frame):   # pylint: disable=redefined-outer-name,unused-argument
+	triggers.disable()
+	triggers.cleanup()
+	capture.cleanup()
+	pHandler.cleanup()
+	platform.cleanup()
+	shutil.rmtree(tmp_path)
+
+	if event_commands['shutdown']:
+		subprocess.Popen(event_commands['shutdown'], shell=True, stdout=subprocess.PIPE)
+
+	sys.exit(0)
+
+
+if __name__ == "__main__":
+
+	if event_commands['startup']:
+		subprocess.Popen(event_commands['startup'], shell=True, stdout=subprocess.PIPE)
+
+	try:
+		capture = alexapi.capture.Capture(config, tmp_path)
+		capture.setup(platform.indicate_recording)
+
+		triggers.init(config, trigger_callback, capture)
+		triggers.setup()
+	except ConfigurationException as exp:
+		alexa_logger.critical(exp)
+		sys.exit(1)
+
+	pHandler.setup()
+	platform.setup()
+
+	for sig in (signal.SIGABRT, signal.SIGILL, signal.SIGINT, signal.SIGSEGV, signal.SIGTERM):
+		signal.signal(sig, cleanup)
+
+	alexa_logger.info("Checking Internet Connection ...")
+	while not internet_on():
+		time.sleep(1)
+
+	platform_trigger_callback = triggers.triggers['platform'].platform_callback if 'platform' in triggers.triggers else None
+	platform.after_setup(platform_trigger_callback)
+	triggers.enable()
+
+	if not silent:
+		player.play_speech(resources_path + "hello.mp3")
+
+	platform.indicate_success()
+
+	while True:
+		time.sleep(1)
